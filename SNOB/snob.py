@@ -10,6 +10,14 @@ import matplotlib.animation as animation
 import matplotlib.pyplot as plt
 import numpy as np
 
+try:
+    import plotly.graph_objects as go
+except ImportError as error:
+    raise SystemExit(
+        "Plotly is required for the interactive 3D figure. "
+        "Install it with: python -m pip install plotly"
+    ) from error
+
 
 # With seed=None, the cluster, starting point, pastel colors, and walk are new
 # at every execution. Set an integer here to reproduce one realization.
@@ -255,12 +263,27 @@ def simulate_slow_membrane_walk(phi, start, rng):
             position = proposed_positions[crossing_offset]
             current_inside = bool(proposed_inside[crossing_offset])
             crossing_points.append((old_position + position) / (2.0 * N))
-            crossing_steps.append(elapsed_steps + 1)
+            crossing_step = elapsed_steps + 1
+            crossing_steps.append(crossing_step)
+
+            # Force the two endpoints of every accepted crossing into the
+            # plotted trajectory.  Consequently, a color transition occurs at
+            # the actual membrane edge instead of at a later subsampled site.
+            if sampled_steps[-1] < elapsed_steps:
+                sampled_positions.append(old_position.astype(float) / N)
+                sampled_steps.append(elapsed_steps)
+            else:
+                sampled_positions[-1] = old_position.astype(float) / N
+            sampled_positions.append(position.astype(float) / N)
+            sampled_steps.append(crossing_step)
         else:
             holding_steps.append(elapsed_steps + 1)
 
         elapsed_steps += 1
-        if elapsed_steps % plot_stride == 0:
+        if (
+            elapsed_steps % plot_stride == 0
+            and sampled_steps[-1] < elapsed_steps
+        ):
             sampled_positions.append(position.astype(float) / N)
             sampled_steps.append(elapsed_steps)
 
@@ -284,6 +307,7 @@ def simulate_slow_membrane_walk(phi, start, rng):
 
     return (
         sampled_positions,
+        sampled_steps,
         crossing_points,
         crossing_indices,
         np.asarray(holding_steps, dtype=np.int64),
@@ -304,11 +328,26 @@ start = nearest_inside_lattice_point(
 if np.linalg.norm(start / N - sphere_centers[0]) >= sphere_radii[0]:
     raise RuntimeError("The walk did not start inside the central sphere.")
 
-walk, crossings, crossing_indices, holding_steps = simulate_slow_membrane_walk(
-    phi_sphere_cluster,
-    start,
-    rng_walk,
-)
+(
+    walk,
+    walk_steps,
+    crossings,
+    crossing_indices,
+    holding_steps,
+) = simulate_slow_membrane_walk(phi_sphere_cluster, start, rng_walk)
+
+crossing_labels = []
+for crossing_number, crossing_index in enumerate(crossing_indices, start=1):
+    before_inside = bool(phi_sphere_cluster(walk[crossing_index - 1]) <= 0)
+    after_inside = bool(phi_sphere_cluster(walk[crossing_index]) <= 0)
+    if before_inside == after_inside:
+        raise RuntimeError("A stored color transition is not a true crossing.")
+    direction_label = (
+        "inside to outside" if before_inside else "outside to inside"
+    )
+    crossing_labels.append(
+        f"accepted crossing {crossing_number}<br>{direction_label}"
+    )
 
 print(f"spheres: {sphere_count}")
 print(f"accepted crossings: {len(crossings)}")
@@ -532,20 +571,29 @@ print(f"image saved to: {image_path}")
 # -----------------------------------------------------------------------------
 # Animation of the same realization
 # -----------------------------------------------------------------------------
-def decimate_for_video(trajectory, indices):
+def decimate_for_video(trajectory, trajectory_steps, indices):
     stride = max(1, int(np.ceil(len(trajectory) / maximum_video_points)))
     retained_indices = np.arange(0, len(trajectory), stride, dtype=np.int64)
+    pre_crossing_indices = np.maximum(indices - 1, 0)
     retained_indices = np.unique(
-        np.concatenate([retained_indices, indices, [len(trajectory) - 1]])
+        np.concatenate(
+            [
+                retained_indices,
+                pre_crossing_indices,
+                indices,
+                [len(trajectory) - 1],
+            ]
+        )
     )
     video_trajectory = trajectory[retained_indices]
     video_crossing_indices = np.searchsorted(retained_indices, indices)
-    video_times = retained_indices / (len(trajectory) - 1)
+    video_times = trajectory_steps[retained_indices] / n_steps
     return video_trajectory, video_crossing_indices, video_times
 
 
 video_walk, video_crossing_indices, video_times = decimate_for_video(
     walk,
+    walk_steps,
     crossing_indices,
 )
 video_cumulative_extent = np.maximum.accumulate(
@@ -638,6 +686,156 @@ def build_camera_follow_schedule():
 camera_azimuths, camera_elevations = build_camera_follow_schedule()
 
 
+video_segment_endpoints = segment_endpoints_for(
+    video_walk,
+    video_crossing_indices,
+)
+crossing_colors = [
+    walk_color(index + 1) for index in range(len(crossings))
+]
+
+
+# -----------------------------------------------------------------------------
+# Interactive 3D figure: drag to rotate, scroll to zoom, hover over crossings
+# -----------------------------------------------------------------------------
+interactive_figure = go.Figure()
+
+for surface in sphere_surfaces:
+    interactive_figure.add_trace(
+        go.Surface(
+            x=surface[0][::2, ::2],
+            y=surface[1][::2, ::2],
+            z=surface[2][::2, ::2],
+            surfacecolor=np.zeros_like(surface[0][::2, ::2]),
+            colorscale=[
+                [0.0, surface_color],
+                [1.0, surface_color],
+            ],
+            cmin=0.0,
+            cmax=1.0,
+            showscale=False,
+            opacity=0.20,
+            hoverinfo="skip",
+            lighting={
+                "ambient": 0.82,
+                "diffuse": 0.45,
+                "specular": 0.08,
+                "roughness": 0.90,
+            },
+        )
+    )
+
+for segment_index in range(len(video_segment_endpoints) - 1):
+    segment_start = int(video_segment_endpoints[segment_index])
+    segment_stop = int(video_segment_endpoints[segment_index + 1])
+    segment = video_walk[segment_start : segment_stop + 1]
+    interactive_figure.add_trace(
+        go.Scatter3d(
+            x=segment[:, 0],
+            y=segment[:, 1],
+            z=segment[:, 2],
+            mode="lines",
+            line={"color": walk_color(segment_index), "width": 3.0},
+            opacity=0.82,
+            hoverinfo="skip",
+            showlegend=False,
+        )
+    )
+
+interactive_figure.add_trace(
+    go.Scatter3d(
+        x=[video_walk[0, 0]],
+        y=[video_walk[0, 1]],
+        z=[video_walk[0, 2]],
+        mode="markers",
+        marker={
+            "size": 6.5,
+            "color": start_marker_color,
+            "line": {"color": "white", "width": 1.0},
+        },
+        text=["starting point"],
+        hovertemplate="%{text}<extra></extra>",
+        showlegend=False,
+    )
+)
+
+if len(crossings):
+    interactive_figure.add_trace(
+        go.Scatter3d(
+            x=crossings[:, 0],
+            y=crossings[:, 1],
+            z=crossings[:, 2],
+            mode="markers",
+            marker={
+                "size": 6.0,
+                "color": crossing_colors,
+                "line": {"color": "white", "width": 1.0},
+            },
+            text=crossing_labels,
+            hovertemplate="%{text}<extra></extra>",
+            showlegend=False,
+        )
+    )
+
+interactive_limits = static_cube_limits(walk)
+initial_azimuth_radians = np.deg2rad(view_azimuth)
+initial_elevation_radians = np.deg2rad(view_elevation)
+camera_radius = 1.75
+interactive_camera = {
+    "eye": {
+        "x": camera_radius
+        * np.cos(initial_elevation_radians)
+        * np.cos(initial_azimuth_radians),
+        "y": camera_radius
+        * np.cos(initial_elevation_radians)
+        * np.sin(initial_azimuth_radians),
+        "z": camera_radius * np.sin(initial_elevation_radians),
+    },
+    "up": {"x": 0.0, "y": 0.0, "z": 1.0},
+}
+
+interactive_figure.update_layout(
+    showlegend=False,
+    paper_bgcolor="white",
+    plot_bgcolor="white",
+    margin={"l": 0, "r": 0, "b": 0, "t": 0},
+    scene={
+        "xaxis": {
+            "visible": False,
+            "range": list(interactive_limits[0]),
+        },
+        "yaxis": {
+            "visible": False,
+            "range": list(interactive_limits[1]),
+        },
+        "zaxis": {
+            "visible": False,
+            "range": list(interactive_limits[2]),
+        },
+        "aspectmode": "cube",
+        "camera": interactive_camera,
+        "dragmode": "orbit",
+        "bgcolor": "white",
+    },
+)
+
+interactive_path = Path(__file__).with_name(
+    f"snob_multiple_spheres_3d_{run_id}_interactive.html"
+)
+interactive_figure.write_html(
+    interactive_path,
+    include_plotlyjs=True,
+    full_html=True,
+    auto_open=False,
+    config={
+        "displaylogo": False,
+        "responsive": True,
+        "scrollZoom": True,
+    },
+)
+print(f"interactive 3D figure saved to: {interactive_path}")
+
+
 video_figure = plt.figure(figsize=(8.4, 7.8))
 video_axis = video_figure.add_subplot(111, projection="3d")
 draw_sphere_cluster(video_axis, coarse=True)
@@ -658,10 +856,6 @@ counter = video_figure.text(
     color="#303030",
 )
 
-video_segment_endpoints = segment_endpoints_for(
-    video_walk,
-    video_crossing_indices,
-)
 line_artists = []
 for segment_index in range(len(video_segment_endpoints) - 1):
     line, = video_axis.plot(
@@ -694,10 +888,6 @@ crossing_artist = video_axis.scatter(
     linewidths=0.4,
     depthshade=False,
 )
-crossing_colors = [
-    walk_color(index + 1) for index in range(len(crossings))
-]
-
 current_position_artist = video_axis.scatter(
     video_walk[0, 0],
     video_walk[0, 1],
